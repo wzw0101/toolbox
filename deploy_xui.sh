@@ -4,16 +4,18 @@
 # 1. 预先收集用户输入信息
 # ==========================================
 clear
-echo "=== 3x-ui 自动化安全部署脚本 (原生 CLI 版) ==="
+echo "=== 3x-ui 自动化安全部署脚本 (全随机免交互版) ==="
 read -p "请输入主域名 (如 example.com，将自动申请泛域名): " MY_DOMAIN
 read -p "请输入 Cloudflare API Token (CF_Token): " CF_TOKEN
 read -p "请输入 Cloudflare 账户 ID (CF_Account_ID): " CF_ACCOUNT_ID
 
-echo -e "\n--- 面板安全配置 ---"
-read -p "请输入 3x-ui 面板登录账号: " PANEL_USER
-read -p "请输入 3x-ui 面板登录密码: " PANEL_PASS
+echo -e "\n--- 面板基础配置 ---"
 read -p "请输入面板监听端口 (如 20742): " PANEL_PORT
 read -p "请输入面板安全访问路径 (如 /secret/，直接回车则默认为 /): " PANEL_PATH
+
+# 自动生成高强度账号与密码 (替代手动输入)
+PANEL_USER="admin_$(openssl rand -hex 3)"
+PANEL_PASS="$(openssl rand -base64 12)"
 
 # 规范化路径格式 (确保以 / 开头和结尾)
 if [[ -z "$PANEL_PATH" ]]; then
@@ -25,13 +27,15 @@ fi
 
 # REALITY 伪装目标设置
 REALITY_DEST="www.icloud.com:443"
-REALITY_SNI="www.icloud.com\",\"icloud.com"
+REALITY_SNI="www.icloud.com"
+
+# 定义证书存放的标准路径
+CERT_DIR="/etc/ssl/certs"
 
 # ==========================================
 # 2. 安装基础依赖
 # ==========================================
 echo -e "\n---> [1/6] 安装基础依赖..."
-# 移除了 sqlite3，只需最基础的网络和证书处理工具
 apt-get update -y
 apt-get install -y curl socat openssl
 
@@ -48,43 +52,44 @@ export CF_Account_ID="$CF_ACCOUNT_ID"
 
 $ACME_BIN --issue --dns dns_cf -d "${MY_DOMAIN}" -d "*.${MY_DOMAIN}"
 
-mkdir -p /etc/x-ui/cert
-echo -e "\n---> [3/6] 将证书部署至 /etc/x-ui/cert 目录..."
+mkdir -p "$CERT_DIR"
+echo -e "\n---> [3/6] 将证书部署至系统标准目录 ${CERT_DIR}..."
 $ACME_BIN --install-cert -d "${MY_DOMAIN}" \
-    --key-file       /etc/x-ui/cert/server.key  \
-    --fullchain-file /etc/x-ui/cert/server.crt \
+    --key-file       "${CERT_DIR}/${MY_DOMAIN}.key"  \
+    --fullchain-file "${CERT_DIR}/${MY_DOMAIN}.crt" \
     --reloadcmd      "x-ui restart"
 
 # ==========================================
-# 4. 纯净安装 3x-ui (无交互)
+# 4. 无人值守安装 3x-ui (n 拒绝自定义，0 跳过 SSL)
 # ==========================================
-echo -e "\n---> [4/6] 正在纯净安装 3x-ui (保持默认配置)..."
-# 传入 n 拒绝安装脚本自带的所有自定义配置与 SSL 引导
-echo "n" | bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+echo -e "\n---> [4/6] 正在纯净安装 3x-ui 面板..."
+# n: 使用官方默认的随机配置跳过向导
+# 0: 在 prompt_and_setup_ssl 环节输入 0，触发兜底退出逻辑，跳过证书申请
+printf "n\n0\n" | bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 
 # ==========================================
-# 5. 调用内置 CLI 配置安全参数与 HTTPS
+# 5. 调用内置 CLI 覆盖所有安全配置
 # ==========================================
-echo -e "\n---> [5/6] 正在通过 x-ui CLI 应用安全配置..."
+echo -e "\n---> [5/6] 正在通过 x-ui CLI 注入安全配置与 HTTPS..."
 
-# 调用 x-ui setting 设置账号、密码、端口、根路径
+# 覆盖官方生成的随机参数，换成我们自己生成的参数和路径
 x-ui setting \
     -username "${PANEL_USER}" \
     -password "${PANEL_PASS}" \
     -port "${PANEL_PORT}" \
     -webBasePath "${PANEL_PATH}"
 
-# 调用 x-ui cert 绑定证书开启 HTTPS
+# 绑定标准目录下的证书
 x-ui cert \
-    -webCert "/etc/x-ui/cert/server.crt" \
-    -webCertKey "/etc/x-ui/cert/server.key"
+    -webCert "${CERT_DIR}/${MY_DOMAIN}.crt" \
+    -webCertKey "${CERT_DIR}/${MY_DOMAIN}.key"
 
-# 重启面板以加载新的 CLI 配置
+# 重启面板以加载 HTTPS 与新凭证
 x-ui restart
-sleep 4 # 等待 HTTPS 服务彻底启动
+sleep 4
 
 # ==========================================
-# 6. 配置 VLESS + REALITY 入站 (通过本地 HTTPS API)
+# 6. 配置 VLESS + REALITY 入站
 # ==========================================
 echo -e "\n---> [6/6] 正在生成 REALITY 密钥并注入节点..."
 
@@ -95,13 +100,11 @@ PUB_KEY=$(echo "$KEYS" | sed -nE 's/.*(Public key:|Password:)[[:space:]]*([^[:sp
 UUID=$(cat /proc/sys/kernel/random/uuid)
 SHORT_ID=$(openssl rand -hex 8)
 
-# API 请求地址 (已启用 HTTPS 和自定义路径)
 BASE_URL="https://127.0.0.1:${PANEL_PORT}${PANEL_PATH}"
 
-# 1. 登录面板获取 Cookie (-k 忽略本地自签名证书验证)
+# 登录面板获取 Cookie (-k 忽略本地自签名证书验证)
 curl -k -s -c cookie.txt -d "username=${PANEL_USER}&password=${PANEL_PASS}" -X POST "${BASE_URL}login" > /dev/null
 
-# 2. 构造 VLESS + REALITY Payload
 API_PAYLOAD=$(cat <<EOF
 {
   "up": 0,
@@ -121,17 +124,18 @@ API_PAYLOAD=$(cat <<EOF
 EOF
 )
 
-# 3. 添加入站并重启底层 Xray
 curl -k -s -b cookie.txt -H "Accept: application/json" -H "Content-Type: application/json" -X POST "${BASE_URL}panel/api/inbounds/add" -d "$API_PAYLOAD" > /dev/null
 
 rm -f cookie.txt
 x-ui restart
 
 echo -e "\n=========================================="
-echo -e "部署完成！安全加固已生效 🎉"
+echo -e "部署完成！极简与极致安全已生效 🎉"
 echo -e "面板地址: https://${MY_DOMAIN}:${PANEL_PORT}${PANEL_PATH}"
+echo -e "=========================================="
 echo -e "面板账号: ${PANEL_USER}"
 echo -e "面板密码: ${PANEL_PASS}"
+echo -e "⚠️ 请务必妥善保存上述随机生成的账号密码！"
 echo -e "=========================================="
 echo -e "已自动创建 VLESS+REALITY 节点，伪装目标为 iCloud。"
 echo -e "REALITY Public Key: ${PUB_KEY}"
